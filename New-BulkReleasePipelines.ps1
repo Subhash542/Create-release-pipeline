@@ -19,7 +19,12 @@ param(
     [string] $Project      = $env:ADO_PROJECT,
     [string] $Pat          = $env:ADO_PAT,
     [int]    $TemplateId   = 27,
-    [string] $ArtifactAlias,
+    [Alias('ArtifactAlias')]
+    [string] $TemplateArtifactAlias,
+    [string] $ArtifactPrefix = "_",
+    [string] $ArtifactSuffix = "_Build",
+    [string] $ReleasePath    = "\",
+    [switch] $SkipCdTrigger,
     [string] $ReportPath   = ".\results.csv",
     [switch] $DryRun
 )
@@ -82,23 +87,84 @@ function New-ReleasePayload($Template, [string] $ApiName, $BuildDef) {
     $body.name        = $ApiName
     $body.description = "Created by bulk automation for $ApiName on $(Get-Date -Format 'yyyy-MM-dd')"
 
-    # Point the build artifact to this API's build (alias is kept so tasks/triggers still work)
-    $buildArtifacts = @($body.artifacts | Where-Object { $_.type -eq 'Build' })
-    if ($ArtifactAlias) { $buildArtifacts = @($buildArtifacts | Where-Object { $_.alias -eq $ArtifactAlias }) }
-    if ($buildArtifacts.Count -eq 0) { throw "Template has no matching Build artifact." }
-    if ($buildArtifacts.Count -gt 1) {
-        throw "Template has multiple Build artifacts ($(($buildArtifacts.alias) -join ', ')); use -ArtifactAlias."
+    # New artifact alias for this API: <ApiName>_Build
+    $newAlias = "$ArtifactPrefix$ApiName$ArtifactSuffix"
+    $projRef  = [pscustomobject]@{ id = $BuildDef.project.id; name = $BuildDef.project.name }
+    $defRef   = [pscustomobject]@{ id = [string]$BuildDef.id; name = $BuildDef.name }
+
+    $artifacts = @($body.artifacts | Where-Object { $_ })
+
+    # Which template artifact should be re-pointed?
+    if ($TemplateArtifactAlias) {
+        $source = @($artifacts | Where-Object { $_.alias -eq $TemplateArtifactAlias })
+        if ($source.Count -eq 0) { throw "Template has no artifact with alias '$TemplateArtifactAlias'." }
+    } else {
+        $source = @($artifacts | Where-Object { $_.type -eq 'Build' })
+        if ($source.Count -gt 1) {
+            throw "Template has multiple Build artifacts ($(($source.alias) -join ', ')); use -TemplateArtifactAlias."
+        }
     }
 
-    $ref = $buildArtifacts[0].definitionReference
-    $ref.definition = [pscustomobject]@{ id = [string]$BuildDef.id; name = $BuildDef.name }
-    $ref.project    = [pscustomobject]@{ id = $BuildDef.project.id; name = $BuildDef.project.name }
-    foreach ($k in 'defaultVersionSpecific','defaultVersionBranch','defaultVersionTags') {
-        $ref.PSObject.Properties.Remove($k)
+    if ($source.Count -eq 1) {
+        # ---- Re-point + rename the template's existing artifact ----
+        $art      = $source[0]
+        $oldAlias = $art.alias
+        $art.type  = 'Build'
+        $art.alias = $newAlias
+        $ref = $art.definitionReference
+        $ref | Add-Member -NotePropertyName definition -NotePropertyValue $defRef  -Force
+        $ref | Add-Member -NotePropertyName project    -NotePropertyValue $projRef -Force
+        foreach ($k in 'defaultVersionSpecific','defaultVersionBranch','defaultVersionTags') {
+            $ref.PSObject.Properties.Remove($k)
+        }
+        if (-not $ref.defaultVersionType) {
+            $ref | Add-Member -NotePropertyName defaultVersionType -NotePropertyValue ([pscustomobject]@{ id = 'latestType'; name = 'Latest' }) -Force
+        }
+
+        # Keep references to the old alias working (triggers, $(Release.Artifacts.<alias>.*), paths)
+        if ($oldAlias -and $oldAlias -ne $newAlias) {
+            foreach ($t in @($body.triggers)) { if ($t -and $t.artifactAlias -eq $oldAlias) { $t.artifactAlias = $newAlias } }
+            $json = $body | ConvertTo-Json -Depth 100
+            $o    = [regex]::Escape($oldAlias)
+            $json = [regex]::Replace($json, "Release\.Artifacts\.$o\.", "Release.Artifacts.$newAlias.")
+            $json = [regex]::Replace($json, "(?<=[/\\])$o(?=[/\\""'\s])", $newAlias)
+            $body = $json | ConvertFrom-Json
+        }
+    }
+    else {
+        # ---- Template has no Build artifact: add a new one ----
+        $hasPrimary = [bool]($artifacts | Where-Object { $_.isPrimary })
+        $newArt = [pscustomobject]@{
+            sourceId            = "$($BuildDef.project.id):$($BuildDef.id)"
+            type                = 'Build'
+            alias               = $newAlias
+            definitionReference = [pscustomobject]@{
+                defaultVersionType = [pscustomobject]@{ id = 'latestType'; name = 'Latest' }
+                definition         = $defRef
+                project            = $projRef
+            }
+            isPrimary           = (-not $hasPrimary)
+            isRetained          = $false
+        }
+        $body | Add-Member -NotePropertyName artifacts -NotePropertyValue @($artifacts + $newArt) -Force
+    }
+
+    # Folder: create in root ("\") instead of the template's folder (e.g. "\_Template")
+    $body | Add-Member -NotePropertyName path -NotePropertyValue $ReleasePath -Force
+
+    # Continuous deployment trigger on the build artifact (keeps any non-artifact triggers, e.g. schedules)
+    if (-not $SkipCdTrigger) {
+        $others = @($body.triggers | Where-Object { $_ -and $_.triggerType -ne 'artifactSource' })
+        $cd = [pscustomobject]@{
+            artifactAlias     = $newAlias
+            triggerConditions = @()
+            triggerType       = 'artifactSource'
+        }
+        $body | Add-Member -NotePropertyName triggers -NotePropertyValue @($others + $cd) -Force
     }
 
     # New stages need fresh ids
-    foreach ($env in $body.environments) { $env.id = 0 }
+    foreach ($stage in $body.environments) { $stage.id = 0 }
     return $body
 }
 
@@ -106,6 +172,9 @@ function New-ReleasePayload($Template, [string] $ApiName, $BuildDef) {
 Write-Host "Loading template $TemplateId ..."
 $template = Invoke-Ado GET "$releaseApi/release/definitions/$TemplateId"
 Write-Host "Template: [$TemplateId] $($template.name)"
+$tArts = @($template.artifacts | Where-Object { $_ })
+if ($tArts.Count -eq 0) { Write-Host "Template artifacts: (none) - a Build artifact named $($ArtifactPrefix)<ApiName>$ArtifactSuffix will be added" }
+else { $tArts | ForEach-Object { Write-Host "Template artifact : alias='$($_.alias)' type='$($_.type)'" } }
 Write-Host "Mode    : $(if ($DryRun) { 'DRY RUN' } else { 'CREATE' })`n"
 
 $rows = @(Import-Csv -Path $CsvPath)
@@ -139,11 +208,11 @@ foreach ($row in $rows) {
                 $buildDef = Get-BuildDefinition $build
                 $payload  = New-ReleasePayload $template $api $buildDef
                 if ($DryRun) {
-                    $status = 'OK-DRY'; $msg = "Would create '$api' using build '$($buildDef.name)' (id $($buildDef.id))"
+                    $status = 'OK-DRY'; $msg = "Would create '$api' with artifact '$ArtifactPrefix$api$ArtifactSuffix' -> build '$($buildDef.name)' (id $($buildDef.id))"
                 }
                 else {
                     $created = Invoke-Ado POST "$releaseApi/release/definitions" $payload
-                    $status = 'CREATED'; $msg = "Release id $($created.id) linked to build '$($buildDef.name)'"
+                    $status = 'CREATED'; $msg = "Release id $($created.id), artifact '$ArtifactPrefix$api$ArtifactSuffix' -> build '$($buildDef.name)'"
                 }
             }
         }
